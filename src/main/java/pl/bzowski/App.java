@@ -1,7 +1,10 @@
 package pl.bzowski;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.channels.FileChannel;
@@ -14,28 +17,36 @@ import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.text.NumberFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
-import  me.tongfei.progressbar.ProgressBar;
+import me.tongfei.progressbar.ProgressBar;
 import javax.swing.filechooser.FileSystemView;
 
 import com.github.sardine.DavResource;
 import com.github.sardine.Sardine;
+import com.github.sardine.SardineFactory;
+import com.google.common.net.UrlEscapers;
+
+import org.apache.commons.io.FileUtils;
 
 public class App {
     private static final String ICEDRIVE_HOST = "https://webdav.icedrive.io/";
     private static long reduce;
     private static List<MyLocalFile> myLocalFiles;
+    private static List<DavResource> list;
 
     public static void main(String[] args) throws IOException {
         // Pobierz nazwę komputera
         String computerName = getComputerName();
         System.out.println(computerName);
 
+        // pobierz dyski komputera
         printDriveLetters();
 
+        // Pokaż zajętą przestrzeń na dysku
         NumberFormat nf = NumberFormat.getNumberInstance();
         for (Path root : FileSystems.getDefault().getRootDirectories()) {
             System.out.print(root + ": ");
@@ -43,32 +54,93 @@ public class App {
                 FileStore fileStore = Files.getFileStore(root);
                 System.out.println("available=" + nf.format(fileStore.getUsableSpace()) + ", total="
                         + nf.format(fileStore.getTotalSpace()));
-                        
+
             } catch (IOException e) {
                 System.out.println("error querying space: " + e.toString());
             }
         }
 
+        // Wylistuj wszystkie pliki na dysku
         List<MyLocalFile> myLocalFiles = getAllFilesForBackup();
 
         reduce = myLocalFiles.stream().mapToLong(MyLocalFile::getSize).reduce(0L, (a, b) -> a + b);
         System.out.println("To Waży: " + reduce);
+
+        Sardine sardine = SardineFactory.begin("x", "x");
+        SardineLocalCache sardineLocalCache = new SardineLocalCache(sardine);
+
+        // sprawdz czy jest katalog o nazwie komputera
+        sardine.list(ICEDRIVE_HOST).stream().filter(davResource -> davResource.getName().equals(computerName))
+                .findFirst().ifPresentOrElse((kot) -> System.out.println("Katalog o nazwie komputera obecny!"), () -> {
+                    try {
+                        sardine.createDirectory(ICEDRIVE_HOST + computerName);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                });
+
+        // sprawdz czy jest dysk d
+        sardine.list(ICEDRIVE_HOST + computerName).stream().filter(davResource -> davResource.getName().equals("D"))
+                .findFirst().ifPresentOrElse((dysk) -> System.out.println("Dysk D jest ustworzony na icedrive"), () -> {
+                    try {
+                        sardine.createDirectory(ICEDRIVE_HOST + computerName + "/D");
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                });
+
+        //Pobierz drzewo plików z icedrive
+        Set<String> iceDriveFiles = makeIceDriveFileTree(sardine, ICEDRIVE_HOST + computerName + "/D/");
         
-        // Sardine sardine = SardineFactory.begin(args[0], args[1]);
+        
 
-        // sardine.list(ICEDRIVE_HOST)
-        // .stream()
-        // .filter(davResource -> davResource.getName().equals(computerName))
-        // .findFirst()
-        // .ifPresent(davResource -> System.out.println(davResource.getName()));
+        try (ProgressBar pb = new ProgressBar("Upload progress:", reduce)) {
+            myLocalFiles.stream().sorted((a, b) -> {
+                return Long.compare(a.getSize(), b.getSize());
+            }).forEach(mlf -> {
+                try {
+                    String fileOnDrivePath = ICEDRIVE_HOST + mlf.getComputedPath();
 
-        // if (sardine.exists(ICEDRIVE_HOST + computerName)) {
-        // System.out.println("got here!");
-        // } else {
-        // sardine.createDirectory(ICEDRIVE_HOST + computerName);
-        // }
-        //
-        // list(sardine, ICEDRIVE_HOST);
+                    if (mlf.getSize() > 0) {
+                        if (!sardine.exists(fileOnDrivePath)) {
+                            InputStream fis = new FileInputStream(new File(mlf.getFilePath()));
+                            String fileDirectoryOnDrive = mlf.getFileDirectory();
+                            Arrays.stream(fileDirectoryOnDrive.split("/")).reduce((a, b) -> {
+                                String ret = a + "/" + b;
+                                sardineLocalCache.createIfNotExists(ICEDRIVE_HOST + ret);
+                                return ret;
+                            });
+                            sardine.put(fileOnDrivePath, fis);
+                            pb.stepBy(mlf.getSize());
+                        } else {
+                            pb.stepBy(mlf.getSize());
+                        }
+                    } else {
+                        System.out.println("File has 0 size! " + mlf.getFilePath());
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+
+            });
+        }
+    }
+
+    private static Set<String> makeIceDriveFileTree(Sardine sardine, String path) throws IOException {
+        Set<String> iceDriveFiles = new HashSet<>();
+        List<DavResource> resources = sardine.list(UrlEscapers.urlFragmentEscaper().escape(path));
+        for(DavResource dr : resources) {
+            if((ICEDRIVE_HOST.substring(0, ICEDRIVE_HOST.length() - 1) + dr.getPath()).equals(path)) {
+                continue;
+            }
+            if(dr.isDirectory()) {
+                Set<String> makeIceDriveFileTree = makeIceDriveFileTree(sardine, ICEDRIVE_HOST.substring(0, ICEDRIVE_HOST.length() - 1) + dr.getPath());
+                iceDriveFiles.addAll(makeIceDriveFileTree);
+            } else {
+                iceDriveFiles.add(dr.getPath());
+            }
+        }
+        return iceDriveFiles;
     }
 
     private static List<MyLocalFile> getAllFilesForBackup() throws IOException {
@@ -77,7 +149,7 @@ public class App {
         long occupiedSpace = 0L;
         try {
             FileStore fileStore = Files.getFileStore(Path.of(path));
-          occupiedSpace = fileStore.getTotalSpace() - fileStore.getUsableSpace();
+            occupiedSpace = fileStore.getTotalSpace() - fileStore.getUsableSpace();
         } catch (IOException e) {
             System.out.println("error querying space: " + e.toString());
         }
@@ -131,7 +203,7 @@ public class App {
             });
             pb.stepTo(occupiedSpace);
         }
-        
+
         return myLocalFiles;
     }
 
